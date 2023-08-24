@@ -8,6 +8,7 @@ use Hydra::Helper::Nix;
 use Hydra::Helper::CatalystUtils;
 use File::Basename;
 use File::LibMagic;
+use File::Temp;
 use File::stat;
 use Data::Dump qw(dump);
 use Nix::Store;
@@ -237,9 +238,16 @@ sub serveFile {
         $c->stash->{'plain'} = { data => grab(cmd => ["nix", "--experimental-features", "nix-command",
                                                       "store", "cat", "--store", getStoreUri(), "$path"]) };
 
+        # Create temporary local file with the contents of the result
+        # should unlink itself when it goes out of scope.
+        my $tmp_fh = File::Temp->new();
+        print $tmp_fh $c->stash->{'plain'}->{data};
+        # ensure it's all written out.
+        $tmp_fh->flush;
+        
         # Detect MIME type.
         state $magic = File::LibMagic->new(follow_symlinks => 1);
-        my $info = $magic->info_from_filename($path);
+        my $info = $magic->info_from_filename($tmp_fh->filename);
         my $type = $info->{mime_with_encoding};
         $c->response->content_type($type);
         $c->forward('Hydra::View::Plain');
