@@ -238,16 +238,24 @@ sub serveFile {
         $c->stash->{'plain'} = { data => grab(cmd => ["nix", "--experimental-features", "nix-command",
                                                       "store", "cat", "--store", getStoreUri(), "$path"]) };
 
-        # Create temporary local file with the contents of the result
-        # should unlink itself when it goes out of scope.
+        # Create temporary local file with the contents of the result if necessary.
+        # Should unlink itself when it goes out of scope by default.
         my $tmp_fh = File::Temp->new();
-        print $tmp_fh $c->stash->{'plain'}->{data};
-        # ensure it's all written out.
-        $tmp_fh->flush;
+
+        # Let's for now assume we need the temp file, and overwrite it if the local $path exists.
+        my $localPath = $tmp_fh->filename;
+
+        if (-e $path) {
+          $localPath = $path;
+        } else {
+          print $tmp_fh $c->stash->{'plain'}->{data};
+          # ensure it's all written out.
+          $tmp_fh->flush;
+        }
         
         # Detect MIME type.
         state $magic = File::LibMagic->new(follow_symlinks => 1);
-        my $info = $magic->info_from_filename($tmp_fh->filename);
+        my $info = $magic->info_from_filename($localPath);
         my $type = $info->{mime_with_encoding};
         $c->response->content_type($type);
         $c->forward('Hydra::View::Plain');
