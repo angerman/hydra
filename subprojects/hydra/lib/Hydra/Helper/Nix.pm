@@ -35,6 +35,7 @@ our @EXPORT = qw(
     getStoreUri
     getTotalShares
     grab
+    isLocalBuildStore
     isLocalStore
     jobsetOverview
     jobsetOverview_
@@ -595,6 +596,38 @@ sub readNixFile {
 
 sub isLocalStore {
     my $uri = getStoreUri();
+    return $uri =~ "^(local|daemon|auto|file)";
+}
+
+
+# Is the store that BUILDS land in local, i.e. can we register GC roots for
+# build outputs?
+#
+# Deliberately not isLocalStore()/getStoreUri(): those prefer
+# `server_store_uri`, which only tells the web frontend where to READ build
+# logs and NARs from -- typically a binary cache -- and says nothing about
+# where builds land.  Conflating the two makes isLocalStore() false on any
+# Hydra configured with a binary-cache `server_store_uri`, and
+# hydra-update-gc-roots then silently skips the whole "register a GC root for
+# each output of a kept build" branch of keepBuild().  Build outputs end up
+# protected only by whatever happens to root their .drv (e.g. nix-eval-jobs
+# --gc-roots-dir plus keep-outputs), while the same script classes those .drv
+# roots as unwanted -- so as soon as it manages to delete them, the outputs of
+# current builds become garbage.
+#
+# Observed on ci.zw3rk.com: 12,138 roots in gc_roots_dir, every one a .drv and
+# not a single output root, 8,962 of them queued for deletion; dropping those
+# made 413 GB of narSize collectable, 74 GB of which was outputs of builds in
+# their jobset's *current* evaluation.  Note a binary cache is normally a
+# different machine across a bandwidth-limited link, so a path also being on
+# the cache does NOT make the local copy expendable.
+#
+# Kept separate from isLocalStore() on purpose: that one also gates
+# web-frontend features (nix channels, serving files out of the store), and
+# changing those is not in scope here.
+sub isLocalBuildStore {
+    my $config = getHydraConfig();
+    my $uri = $config->{'store_uri'} // "auto";
     return $uri =~ "^(local|daemon|auto|file)";
 }
 

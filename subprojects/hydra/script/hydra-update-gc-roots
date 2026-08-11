@@ -47,7 +47,13 @@ sub keepBuild {
         $jobset->get_column('project'), ":", $jobset->get_column('name'), ":", $build->get_column('job'), "; ",
         $build->system, "; ",
         strftime("%Y-%m-%d %H:%M:%S", localtime($build->timestamp)), ")\n";
-    if (isLocalStore &&
+    # isLocalBuildStore, not isLocalStore: the latter keys off
+    # `server_store_uri`, which is only the web frontend's read source (usually
+    # a binary cache) and says nothing about where builds land.  With a cache
+    # configured there, this branch never ran, so no build output ever got a GC
+    # root -- while the removal pass below treats the .drv roots that were
+    # protecting those outputs as unwanted.  See Hydra::Helper::Nix.
+    if (isLocalBuildStore &&
         $build->finished && ($build->buildstatus == 0 || $build->buildstatus == 6))
     {
         # `outpaths` is aggregated by raw SQL, so it is a list of full paths.
