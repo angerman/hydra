@@ -66,12 +66,27 @@ sub keepBuild {
             }
         }
     }
-    if (!$build->finished || ($keepFailedDrvs && $build->buildstatus != 0)) {
-        if (machineLocalStore()->isValidPath($build->drvpath)) {
-            addRoot $build->drvpath;
-        } else {
-            print STDERR "    warning: derivation ", printStorePath($storeDir, $build->drvpath), " has disappeared\n";
-        }
+    # Root the derivation of every kept build whose .drv we still have, not just
+    # unfinished/failed ones.
+    #
+    # On a Hydra whose builds run on remote machines, outputs are uploaded to a
+    # binary cache and never copied back, so the loop above finds nothing to
+    # root: measured on ci.zw3rk.com, 50,149 outputs of kept builds were absent
+    # from the local store and exactly zero output roots were created, while
+    # 6,094 of 9,216 existing roots were classed unwanted.  Deleting those is
+    # not safe -- with `keep-outputs` (which such a Hydra wants anyway) a rooted
+    # .drv is what keeps whichever outputs ARE local alive, and a path also
+    # existing on the cache does not make the local copy expendable: the cache
+    # is a different machine, usually across a bandwidth-limited link.
+    #
+    # Rooting the .drv is also what nix-eval-jobs --gc-roots-dir already does
+    # incidentally; doing it here makes retention follow Hydra's own keepnr
+    # policy instead of depending on which drvs an evaluator happened to pin.
+    if (machineLocalStore()->isValidPath($build->drvpath)) {
+        addRoot $build->drvpath;
+    } elsif (!$build->finished || ($keepFailedDrvs && $build->buildstatus != 0)) {
+        print STDERR "    warning: derivation ", printStorePath($storeDir, $build->drvpath), " has disappeared\n";
+    }
     }
 }
 
