@@ -168,8 +168,18 @@ sub registerRoot {
         # Stale symlink: remove it so we can replace it below.
         unlink $link;
     } elsif (-e $link) {
-        # A plain file root already exists. It may belong to another user
-        # (e.g. the old queue runner or hydra-server), so don't open it for writing.
+        # Already rooted by a regular file -- which is how this function itself
+        # records a root.  Upstream guarded the whole body with
+        # `return if -e $link`; replacing that with the `-l` test above dropped
+        # the regular-file case, and re-opening is not merely wasted work:
+        # ">" TRUNCATES, so it needs write permission on the FILE rather than
+        # on the directory.  These roots are not writable by every hydra user.
+        # update-hydra-gc-roots' ExecStartPre chowns each one to hydra:hydra
+        # and leaves mode 644, so the web frontend (hydra-www, in group hydra
+        # but not the owner) then gets EACCES and "Restart failed builds" dies
+        # with `cannot create GC root`.  The root already exists and its
+        # contents are irrelevant -- an empty file whose NAME is the store
+        # path -- so there is nothing to refresh.  Return instead.
         return;
     }
     open(my $root, ">", $link) or die "cannot create GC root `$link' to `$path': $!";
