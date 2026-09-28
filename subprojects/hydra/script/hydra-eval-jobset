@@ -398,8 +398,18 @@ sub inputsToArgs {
 # The `nix-eval-jobs` invocation for a jobset. Separate from running it
 # because the arguments describe the evaluation regardless of who performs
 # it or where.
+
+# Projects whose flake jobsets are evaluated in pure mode, from the
+# space/comma-separated `evaluator_pure_eval_projects` setting.
+sub pureEvalProject {
+    my ($projectName) = @_;
+    my %pure = map { $_ => 1 } grep { $_ ne "" }
+        split /[\s,]+/, ($config->{evaluator_pure_eval_projects} // "");
+    return exists $pure{$projectName};
+}
+
 sub evalJobsCmd {
-    my ($inputInfo, $nixExprInputName, $nixExprPath, $flakeRef, $gcRootsDir) = @_;
+    my ($inputInfo, $nixExprInputName, $nixExprPath, $flakeRef, $gcRootsDir, $projectName) = @_;
 
     my @cmd;
 
@@ -412,6 +422,13 @@ sub evalJobsCmd {
                 "--option", "eval-cache", "false",
                 "--flake", $flakeRef,
                 "--select", "flake: flake.outputs.hydraJobs or flake.outputs.checks or (throw \"flake does not provide any Hydra jobs or checks\")");
+        # For listed projects, evaluate purely: the flake then cannot see the
+        # evaluator host's `builtins.currentSystem` or environment (which e.g.
+        # makes haskell.nix derive the wrong evalSystem).  The flake ref is
+        # locked (it carries a narHash), as pure mode requires.  Unset, nothing
+        # changes.
+        push @cmd, ("--option", "pure-eval", "true")
+            if defined $projectName && pureEvalProject($projectName);
     } else {
         my $nixExprInput = $inputInfo->{$nixExprInputName}->[0]
             or die "cannot find the input containing the job expression\n";
@@ -436,12 +453,12 @@ sub evalJobsCmd {
 
 
 sub evalJobs {
-    my ($jobsetName, $inputInfo, $nixExprInputName, $nixExprPath, $flakeRef) = @_;
+    my ($jobsetName, $inputInfo, $nixExprInputName, $nixExprPath, $flakeRef, $projectName) = @_;
 
     print STDERR "($jobsetName) Evaluating...\n";
 
     my @cmd = evalJobsCmd($inputInfo, $nixExprInputName, $nixExprPath, $flakeRef,
-                          getGCRootsDir);
+                          getGCRootsDir, $projectName);
 
     if (defined $ENV{'HYDRA_DEBUG'}) {
         sub escape {
@@ -867,7 +884,7 @@ sub checkJobsetWrapped {
     # Evaluate the job expression.
     my $evalStart = clock_gettime(CLOCK_MONOTONIC);
     my $evalStop;
-    my $jobsIter = evalJobs($project->name . ":" . $jobset->name, $inputInfo, $jobset->nixexprinput, $jobset->nixexprpath, $flakeRef);
+    my $jobsIter = evalJobs($project->name . ":" . $jobset->name, $inputInfo, $jobset->nixexprinput, $jobset->nixexprpath, $flakeRef, $project->name);
 
     if ($dryRun) {
         while (defined(my $job = $jobsIter->())) {
