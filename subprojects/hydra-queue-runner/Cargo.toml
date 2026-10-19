@@ -78,7 +78,9 @@ store-transfer.workspace                 = true
 
 [dev-dependencies]
 harmonia-file-nar = { workspace = true, features = [ "test" ] }
+sqlx.workspace    = true
 tempfile          = "3.23.0"
+test-utils        = { path = "../crates/test-utils" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 procfs.workspace = true

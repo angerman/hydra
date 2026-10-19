@@ -135,18 +135,23 @@ pub struct ScheduledItem {
     pub step_info: Arc<StepInfo>,
     pub build_queue: Arc<BuildQueue>,
     pub machine: Arc<super::Machine>,
+    // Removal from `scheduled` starts result processing. Keep ownership until
+    // that processing (and any snapshots of the item) has finished as well.
+    _dispatch_claim: Arc<tokio::sync::OwnedMutexGuard<()>>,
 }
 
 impl ScheduledItem {
-    const fn new(
+    fn new(
         step_info: Arc<StepInfo>,
         build_queue: Arc<BuildQueue>,
         machine: Arc<super::Machine>,
+        dispatch_claim: tokio::sync::OwnedMutexGuard<()>,
     ) -> Self {
         Self {
             step_info,
             build_queue,
             machine,
+            _dispatch_claim: Arc::new(dispatch_claim),
         }
     }
 }
@@ -226,16 +231,17 @@ impl InnerQueues {
         self.inner.clone()
     }
 
-    #[tracing::instrument(skip(self, step, queue, machine), fields(drv=%step.step.get_drv_path(), machine_id=%machine.id))]
+    #[tracing::instrument(skip(self, step, queue, machine, dispatch_claim), fields(drv=%step.step.get_drv_path(), machine_id=%machine.id))]
     fn add_job_to_scheduled(
         &self,
         step: &Arc<StepInfo>,
         queue: &Arc<BuildQueue>,
         machine: Arc<super::Machine>,
+        dispatch_claim: tokio::sync::OwnedMutexGuard<()>,
     ) {
         self.scheduled.write().insert(
             step.step.get_drv_path().to_owned(),
-            ScheduledItem::new(step.clone(), queue.clone(), machine),
+            ScheduledItem::new(step.clone(), queue.clone(), machine, dispatch_claim),
         );
         step.set_already_scheduled(true);
         queue.incr_active();
@@ -473,6 +479,9 @@ impl Queues {
                     nr_steps_waiting_all_queues += 1;
                     continue;
                 }
+                let Ok(dispatch_claim) = job.step.dispatch_lock.clone().try_lock_owned() else {
+                    continue;
+                };
                 if job.get_already_scheduled() {
                     tracing::debug!(
                         "Can't schedule job because job is already scheduled system={system} drv={}",
@@ -502,7 +511,8 @@ impl Queues {
                         let wait_seconds = now.duration_since(job.runnable_since).as_secs_f64();
                         metrics.observe_job_wait_time(wait_seconds, &system);
 
-                        self.add_job_to_scheduled(&job, &queue, m).await;
+                        self.add_job_to_scheduled(&job, &queue, m, dispatch_claim)
+                            .await;
                     }
                     Ok(crate::state::RealiseStepResult::None) => {
                         tracing::debug!(
@@ -557,15 +567,16 @@ impl Queues {
         self.inner.read().await.clone_inner()
     }
 
-    #[tracing::instrument(skip(self, step, queue, machine), fields(drv=%step.step.get_drv_path(), machine_id=%machine.id))]
+    #[tracing::instrument(skip(self, step, queue, machine, dispatch_claim), fields(drv=%step.step.get_drv_path(), machine_id=%machine.id))]
     pub async fn add_job_to_scheduled(
         &self,
         step: &Arc<StepInfo>,
         queue: &Arc<BuildQueue>,
         machine: Arc<super::Machine>,
+        dispatch_claim: tokio::sync::OwnedMutexGuard<()>,
     ) {
         let rq = self.inner.read().await;
-        rq.add_job_to_scheduled(step, queue, machine);
+        rq.add_job_to_scheduled(step, queue, machine, dispatch_claim);
     }
 
     #[tracing::instrument(skip(self), fields(%drv))]

@@ -12,6 +12,9 @@ mod step;
 mod step_info;
 mod uploader;
 
+#[cfg(test)]
+mod cached_output_tests;
+
 pub use atomic::AtomicDateTime;
 
 /// Errors from external subsystems, plus the combined state-logic errors
@@ -2227,6 +2230,7 @@ impl State {
             }
         }
         item.step_info.step.make_rdeps_runnable();
+        drop(item);
 
         // always trigger dispatch, as we now might have a free machine again
         self.trigger_dispatch();
@@ -2829,7 +2833,15 @@ impl State {
                 .as_ref()
                 .map(|(step, relation)| (step, relation.clone())),
         );
+        let dispatch_claim = step.dispatch_lock.clone().try_lock_owned().ok();
         if !is_new {
+            // Outputs may have appeared since this step was queued, for
+            // example through a concurrent build or an external store import.
+            // A dispatcher, assigned builder or result handler still owns its
+            // outcome until its claim is released.
+            if dispatch_claim.is_none() {
+                return CreateStepResult::Valid(step);
+            }
             return self.recheck_existing_step(step, &drv_path, &ctx).await;
         }
         self.metrics.queue_steps_created.inc();
@@ -2843,6 +2855,13 @@ impl State {
             availability,
             previous_failure,
         } = facts;
+        // A replacement Step may still belong to an earlier result handler.
+        // Initialise its graph now, but leave all output decisions to the next
+        // reload or dispatch after that handler releases the shared claim.
+        let (availability, previous_failure) = match &dispatch_claim {
+            Some(_) => (availability, previous_failure),
+            None => (OutputAvailability::Incomplete, false),
+        };
         let input_drvs = drv::input_drvs(&drv);
         step.set_drv(&drv, self.connector.store_dir());
 

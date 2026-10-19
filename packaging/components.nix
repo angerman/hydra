@@ -16,11 +16,13 @@ self': {
   inherit version releaseVersion;
   rustWorkspace = self'.callPackage ./rust-workspace.nix {
     inherit craneLib;
+    nixCli = nixComponents.nix-cli;
   };
   hydra-cargo-deps = self'.rustWorkspace.cargoArtifacts;
   hydra-clippy = self'.rustWorkspace.clippy;
   hydra-clippy-all = self'.rustWorkspace.clippyAll;
   hydra-rust-tests = self'.rustWorkspace.tests;
+  hydra-cached-outputs = self'.rustWorkspace.cached-outputs;
   nix-eval-jobs = self'.callPackage nix-eval-jobs-src {
     inherit nixComponents;
   };

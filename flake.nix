@@ -232,6 +232,7 @@
         // (nixpkgs.lib.optionalAttrs (builtins.elem system linuxSystems) {
           install = hydraJobs.nixosTests.install.${system};
           validate-openapi = hydraJobs.nixosTests.validate-openapi.${system};
+          cached-outputs = packages.${system}.hydra-cached-outputs;
         })
       );
 

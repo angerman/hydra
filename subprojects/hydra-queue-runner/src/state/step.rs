@@ -188,6 +188,9 @@ pub struct Step {
     me: Weak<Step>,
     pending_runnable: PendingRunnable,
 
+    // Dispatch, builder ownership and cached completion share this claim.
+    pub(super) dispatch_lock: Arc<tokio::sync::Mutex<()>>,
+
     runnable: AtomicBool,
     /// The step is currently held in the dispatch queues.
     queued: AtomicBool,
@@ -246,11 +249,25 @@ impl Hash for ByPtr {
 impl Step {
     #[must_use]
     pub fn new(drv_path: StorePath, pending_runnable: PendingRunnable) -> Arc<Self> {
+        Self::with_dispatch_lock(
+            drv_path,
+            pending_runnable,
+            Arc::new(tokio::sync::Mutex::new(())),
+        )
+    }
+
+    fn with_dispatch_lock(
+        drv_path: StorePath,
+        pending_runnable: PendingRunnable,
+        dispatch_lock: Arc<tokio::sync::Mutex<()>>,
+    ) -> Arc<Self> {
         Arc::new_cyclic(|me| Self {
             drv_path,
             drv_info: arc_swap::ArcSwapOption::from(None),
             me: me.clone(),
             pending_runnable,
+            dispatch_lock,
+
             runnable: false.into(),
             queued: false.into(),
             finished: false.into(),
@@ -640,6 +657,9 @@ pub struct Steps {
     cp_computed_at: Arc<AtomicU64>,
     /// Last full runnable scan (unix seconds).
     full_scan_at: Arc<AtomicU64>,
+    // Result processing can remove a Step before releasing its dispatch claim.
+    // Replacements must share that claim until the old owner has finished.
+    dispatch_locks: Arc<parking_lot::Mutex<HashMap<StorePath, Weak<tokio::sync::Mutex<()>>>>>,
 }
 
 impl Default for Steps {
@@ -663,6 +683,7 @@ impl Steps {
             pending_runnable: Arc::default(),
             cp_computed_at: Arc::new(0.into()),
             full_scan_at: Arc::new(0.into()),
+            dispatch_locks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         }
     }
 
@@ -709,6 +730,9 @@ impl Steps {
     #[must_use]
     pub fn clone_runnable(&self) -> Vec<Arc<Step>> {
         let mut steps = self.inner.write();
+        self.dispatch_locks
+            .lock()
+            .retain(|_, claim| claim.strong_count() != 0);
         let mut new_runnable = Vec::with_capacity(steps.len());
         steps.retain(|_, r| {
             let Some(step) = r.upgrade() else {
@@ -833,15 +857,31 @@ impl Steps {
     ) -> (Arc<Step>, bool) {
         let mut is_new = false;
         let mut steps = self.inner.write();
+        let new_step = || {
+            let mut dispatch_locks = self.dispatch_locks.lock();
+            let dispatch_lock = dispatch_locks
+                .get(drv_path)
+                .and_then(Weak::upgrade)
+                .unwrap_or_else(|| {
+                    let claim = Arc::new(tokio::sync::Mutex::new(()));
+                    dispatch_locks.insert(drv_path.to_owned(), Arc::downgrade(&claim));
+                    claim
+                });
+            Step::with_dispatch_lock(
+                drv_path.to_owned(),
+                self.pending_runnable.clone(),
+                dispatch_lock,
+            )
+        };
         let step = if let Some(step) = steps.get(drv_path) {
             step.upgrade().unwrap_or_else(|| {
                 steps.remove(drv_path);
                 is_new = true;
-                Step::new(drv_path.to_owned(), self.pending_runnable.clone())
+                new_step()
             })
         } else {
             is_new = true;
-            Step::new(drv_path.to_owned(), self.pending_runnable.clone())
+            new_step()
         };
 
         step.add_referring_data(referring_build, referring_step);

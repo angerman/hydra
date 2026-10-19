@@ -9,6 +9,9 @@
   pkg-config,
   rust-jemalloc-sys,
   postgresql_17,
+  # Provides nix-store, nix-instantiate and nix-daemon for the
+  # cached-outputs regression check below.
+  nixCli,
   # Features are a property of the workspace, not of an individual crate: cargo
   # resolves them once for the whole `--workspace` build, so a per-crate knob
   # would just fork the build. Override this on the scope to move every crate
@@ -111,6 +114,48 @@ let
     }
   );
 
+  # Regression test for cached-output queue rechecks (see
+  # `hydra-queue-runner/src/state/cached_output_tests.rs`). Those tests are
+  # `#[ignore]`d: each needs a private Nix store served by a private daemon
+  # plus a throwaway Postgres, so the workspace-wide nextest check above
+  # skips them. This check provides that fixture and runs them.
+  cached-outputs = craneLib.cargoNextest (
+    commonArgs
+    // {
+      inherit cargoArtifacts;
+      nativeBuildInputs = commonArgs.nativeBuildInputs ++ [
+        postgresql_17
+        nixCli
+      ];
+      cargoNextestExtraArgs = "--run-ignored ignored-only -p hydra-queue-runner --lib cached_output failedpaths_record missing_output_remains_pending_on_recheck";
+      preCheck = ''
+        export LOGNAME="$(id -un)"
+        export HYDRA_QUEUE_TEST_STORE="$TMPDIR/queue-test-store"
+        export NIX_STORE_DIR="$HYDRA_QUEUE_TEST_STORE/store"
+        export NIX_STATE_DIR="$HYDRA_QUEUE_TEST_STORE/state"
+        export NIX_LOG_DIR="$HYDRA_QUEUE_TEST_STORE/log"
+        export NIX_CONF_DIR="$HYDRA_QUEUE_TEST_STORE/conf"
+        export NIX_USER_CONF_FILES=/dev/null
+        unset NIX_CONFIG HYDRA_DATABASE_URL
+        mkdir -p "$NIX_STORE_DIR" "$NIX_STATE_DIR" "$NIX_LOG_DIR" "$NIX_CONF_DIR"
+        export NIX_REMOTE="local?store=$NIX_STORE_DIR&state=$NIX_STATE_DIR&log=$NIX_LOG_DIR"
+        printf '%s\n' 'build-users-group =' 'substituters =' \
+          'experimental-features = nix-command' > "$NIX_CONF_DIR/nix.conf"
+
+        # The queue runner talks to the store through the daemon, which
+        # listens at $NIX_STATE_DIR/daemon-socket/socket by default.
+        nix-daemon &
+        hydra_queue_daemon_pid=$!
+        trap 'kill "$hydra_queue_daemon_pid"' EXIT
+        for _ in $(seq 1 100); do
+          if [ -S "$NIX_STATE_DIR/daemon-socket/socket" ]; then break; fi
+          sleep 0.1
+        done
+        [ -S "$NIX_STATE_DIR/daemon-socket/socket" ]
+      '';
+    }
+  );
+
   # Lints feature-gated code (e.g. `otel`) too, at the cost of its own
   # dependency build, since the features change the dependency graph.
   allFeaturesArgs = commonArgs // {
@@ -149,6 +194,7 @@ in
     clippy
     clippyAll
     tests
+    cached-outputs
     ;
 
   hydra-builder = mkCrate {

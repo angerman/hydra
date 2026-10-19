@@ -157,6 +157,18 @@ $ nix develop
 $ cargo test
 ```
 
+The cached-output queue regression uses a private PostgreSQL instance and Nix
+store. Run its guarded driver on Linux with:
+
+```
+$ nix build .#checks.x86_64-linux.cached-outputs
+```
+
+It checks that outputs registered after a queue step was created finish the
+cached build and release dependent steps, while missing outputs and recorded
+failures keep their existing behavior. The corresponding Rust tests are ignored
+by a plain `cargo test` because they require this isolated fixture.
+
 ### JSON API
 
 You can also interface with Hydra through a JSON API.
