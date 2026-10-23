@@ -357,7 +357,7 @@ async fn insert_test_builds(
         )
         .bind(jobset_id)
         .bind(name)
-        .bind(store_dir.display(drv_path).to_string())
+        .bind(store_dir.display(*drv_path).to_string())
         .fetch_one(pool)
         .await
         .expect("insert pending test build");
