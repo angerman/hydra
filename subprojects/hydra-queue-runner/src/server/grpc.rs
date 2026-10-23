@@ -333,6 +333,10 @@ impl RunnerService for Server {
         };
 
         let state = self.state.clone();
+        // The builder reuses its machine id when it reconnects; the session
+        // identifies this tunnel's registration so that tearing the tunnel
+        // down below never removes a newer one.
+        let session = machine.session;
         let machine_id = state.insert_machine(machine.clone()).await;
         tracing::info!("Registered new machine: machine_id={machine_id} machine={machine}",);
 
@@ -363,7 +367,7 @@ impl RunnerService for Server {
                         };
                         if let Err(e) = output_tx.send(Ok(msg)).await {
                             tracing::error!("Failed to send message to machine={machine_id} e={e}");
-                            state.remove_machine(machine_id).await;
+                            state.remove_machine_session(machine_id, session).await;
                             break
                         }
                     },
@@ -371,11 +375,11 @@ impl RunnerService for Server {
                         if let Some(msg) = msg {
                             if let Err(e) = output_tx.send(Ok(msg.into_request())).await {
                                 tracing::error!("Failed to send message to machine={machine_id} e={e}");
-                                state.remove_machine(machine_id).await;
+                                state.remove_machine_session(machine_id, session).await;
                                 break
                             }
                         } else {
-                            state.remove_machine(machine_id).await;
+                            state.remove_machine_session(machine_id, session).await;
                             break
                         }
                     },
@@ -386,20 +390,20 @@ impl RunnerService for Server {
                             if let Some(io_err) = match_for_io_error(&err)
                                 && io_err.kind() == std::io::ErrorKind::BrokenPipe {
                                     tracing::error!("client disconnected: broken pipe: machine={machine_id} hostname={}", machine.hostname);
-                                    state.remove_machine(machine_id).await;
+                                    state.remove_machine_session(machine_id, session).await;
                                     break;
                                 }
 
                             match output_tx.send(Err(err)).await {
                                 Ok(()) => (),
                                 Err(_err) => {
-                                    state.remove_machine(machine_id).await;
+                                    state.remove_machine_session(machine_id, session).await;
                                     break
                                 }
                             }
                         },
                         None => {
-                            state.remove_machine(machine_id).await;
+                            state.remove_machine_session(machine_id, session).await;
                             break
                         }
                     }

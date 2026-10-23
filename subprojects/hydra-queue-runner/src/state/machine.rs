@@ -391,6 +391,39 @@ impl Machines {
         m
     }
 
+    /// Remove the machine only if it is still the registration made by
+    /// `session`: after a builder reconnects, the old tunnel's cleanup must
+    /// not unregister the new connection.
+    #[tracing::instrument(skip(self, machine_id, session))]
+    pub fn remove_machine_session(
+        &self,
+        machine_id: uuid::Uuid,
+        session: uuid::Uuid,
+    ) -> Option<Arc<Machine>> {
+        let m = {
+            let mut inner = self.inner.write();
+            if inner
+                .by_uuid
+                .get(&machine_id)
+                .is_some_and(|m| m.session == session)
+            {
+                let m = inner.by_uuid.remove(&machine_id);
+                if let Some(m) = &m {
+                    for system in &m.systems {
+                        if let Some(v) = inner.by_system.get_mut(system) {
+                            v.retain(|o| o.id != machine_id);
+                        }
+                    }
+                }
+                m
+            } else {
+                None
+            }
+        };
+        self.reconstruct_supported_features();
+        m
+    }
+
     #[tracing::instrument(skip(self, machine_id))]
     pub fn get_machine_by_id(&self, machine_id: uuid::Uuid) -> Option<Arc<Machine>> {
         let inner = self.inner.read();
@@ -564,6 +597,9 @@ impl Message {
 #[derive(Debug, Clone)]
 pub struct Machine {
     pub id: uuid::Uuid,
+    /// One per tunnel.  A builder keeps its `id` across reconnects, so the
+    /// id alone cannot tell this connection's registration from the next.
+    pub session: uuid::Uuid,
     pub systems: SmallVec<[System; 4]>,
     pub hostname: String,
     pub cpu_count: u32,
@@ -647,6 +683,7 @@ impl Machine {
 
         Ok(Self {
             id: msg.machine_id.parse()?,
+            session: uuid::Uuid::new_v4(),
             systems: msg.systems.into(),
             hostname: msg.hostname,
             cpu_count: msg.cpu_count,
@@ -1039,6 +1076,7 @@ mod tests {
         stats.store_current_jobs(current_jobs);
         Arc::new(Machine {
             id: uuid::Uuid::new_v4(),
+            session: uuid::Uuid::new_v4(),
             systems: SmallVec::new(),
             hostname: hostname.to_owned(),
             cpu_count: 1,
@@ -1090,5 +1128,65 @@ mod tests {
     fn test_least_loaded_tie_keeps_score_order() {
         let machines = [machine("first", 8, 1), machine("second", 8, 1)];
         assert_eq!(pick(&machines), "first");
+    }
+
+    /// The same builder (same id) on a new tunnel, as after a reconnect.
+    fn reconnected(m: &Machine) -> Machine {
+        let mut n = m.clone();
+        n.session = uuid::Uuid::new_v4();
+        n
+    }
+
+    fn linux_machine() -> Machine {
+        let mut m = (*machine("mac", 4, 0)).clone();
+        m.systems = SmallVec::from_vec(vec!["x86_64-linux".to_owned()]);
+        m
+    }
+
+    #[test]
+    fn test_old_session_does_not_remove_reconnected_machine() {
+        let machines = Machines::new();
+        let old = linux_machine();
+        let new = reconnected(&old);
+        let (id, old_session, new_session) = (old.id, old.session, new.session);
+        machines.insert_machine(old, MachineSortFn::default());
+        // insert_machine in State retires the old registration first.
+        assert!(machines.remove_machine(id).is_some());
+        machines.insert_machine(new, MachineSortFn::default());
+
+        // The old tunnel's teardown arrives late: it must leave the new one.
+        assert!(machines.remove_machine_session(id, old_session).is_none());
+        let current = machines.get_machine_by_id(id).expect("still registered");
+        assert_eq!(current.session, new_session);
+        assert_eq!(
+            machines
+                .get_machine_for_system("x86_64-linux", &[], None)
+                .map(|m| m.session),
+            Some(new_session)
+        );
+
+        assert!(machines.remove_machine_session(id, new_session).is_some());
+        assert!(machines.get_machine_by_id(id).is_none());
+        assert!(
+            machines
+                .get_machine_for_system("x86_64-linux", &[], None)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_remove_machine_returns_the_replaced_registration() {
+        // What State::insert_machine relies on to fail the old tunnel's jobs.
+        let machines = Machines::new();
+        let old = linux_machine();
+        let (id, old_session) = (old.id, old.session);
+        machines.insert_machine(old, MachineSortFn::default());
+        let removed = machines.remove_machine(id).expect("registered");
+        assert_eq!(removed.session, old_session);
+        assert!(
+            machines
+                .get_machine_for_system("x86_64-linux", &[], None)
+                .is_none()
+        );
     }
 }

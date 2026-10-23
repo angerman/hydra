@@ -572,6 +572,20 @@ impl State {
 
     #[tracing::instrument(skip(self, machine))]
     pub async fn insert_machine(&self, machine: Machine) -> uuid::Uuid {
+        // A builder reconnects with the id it had before.  If the old tunnel
+        // has not been torn down yet, its registration (and the steps it
+        // holds) would be replaced without being failed, leaving their
+        // buildsteps busy forever and the builds stuck.  Retire it first,
+        // exactly as a disconnect does.
+        if let Some(old) = self.machines.remove_machine(machine.id) {
+            tracing::warn!(
+                "machine re-registered before its old tunnel was removed; retiring the old registration: machine_id={} hostname={} jobs={}",
+                old.id,
+                old.hostname,
+                old.jobs.read().len(),
+            );
+            self.retire_machine(old).await;
+        }
         if !machine.systems.is_empty() {
             self.queues
                 .ensure_queues_for_systems(&machine.systems)
@@ -588,71 +602,87 @@ impl State {
     #[tracing::instrument(skip(self))]
     pub async fn remove_machine(&self, machine_id: uuid::Uuid) {
         if let Some(m) = self.machines.remove_machine(machine_id) {
-            let jobs = {
-                let jobs = m.jobs.read();
-                jobs.clone()
-            };
-            for job in &jobs {
+            self.retire_machine(m).await;
+        }
+    }
+
+    /// Remove a tunnel's registration when the tunnel ends, unless the
+    /// builder has since reconnected and registered a new session.
+    #[tracing::instrument(skip(self))]
+    pub async fn remove_machine_session(&self, machine_id: uuid::Uuid, session: uuid::Uuid) {
+        if let Some(m) = self.machines.remove_machine_session(machine_id, session) {
+            self.retire_machine(m).await;
+        }
+    }
+
+    /// Fail (as Aborted, so they retry) the steps of a machine that is no
+    /// longer registered.
+    async fn retire_machine(&self, m: Arc<Machine>) {
+        let machine_id = m.id;
+        let jobs = {
+            let jobs = m.jobs.read();
+            jobs.clone()
+        };
+        for job in &jobs {
+            if let Err(e) = self
+                .fail_step(
+                    machine_id,
+                    &job.path,
+                    // The machine went away (disconnect or shutdown); the
+                    // step itself did not fail. Record Aborted, like
+                    // clear_busy, and let the retry reschedule it.
+                    BuildResultState::Aborted,
+                    BuildTimings::default(),
+                    None,
+                )
+                .await
+            {
+                tracing::error!(
+                    "Failed to fail step machine_id={machine_id} drv={} e={e}",
+                    job.path
+                );
+                // fail_step did not finalize this step (e.g. the step was
+                // re-dispatched to another machine and now belongs to it).
+                // Reconcile this machine's own orphaned buildstep row so
+                // the DB does not keep showing it busy until the next
+                // queue-runner restart.
                 if let Err(e) = self
-                    .fail_step(
-                        machine_id,
-                        &job.path,
-                        // The machine went away (disconnect or shutdown); the
-                        // step itself did not fail. Record Aborted, like
-                        // clear_busy, and let the retry reschedule it.
-                        BuildResultState::Aborted,
-                        BuildTimings::default(),
-                        None,
-                    )
+                    .abort_orphaned_build_step(job.build_id, job.step_nr)
                     .await
                 {
                     tracing::error!(
-                        "Failed to fail step machine_id={machine_id} drv={} e={e}",
-                        job.path
+                        "Failed to clear orphaned busy step build_id={} step_nr={} e={e}",
+                        job.build_id,
+                        job.step_nr,
                     );
-                    // fail_step did not finalize this step (e.g. the step was
-                    // re-dispatched to another machine and now belongs to it).
-                    // Reconcile this machine's own orphaned buildstep row so
-                    // the DB does not keep showing it busy until the next
-                    // queue-runner restart.
-                    if let Err(e) = self
-                        .abort_orphaned_build_step(job.build_id, job.step_nr)
-                        .await
-                    {
-                        tracing::error!(
-                            "Failed to clear orphaned busy step build_id={} step_nr={} e={e}",
-                            job.build_id,
-                            job.step_nr,
-                        );
-                    }
                 }
             }
+        }
 
-            // Also fail jobs whose slot was already freed (SlotFreed sent,
-            // CompleteBuild not yet received).  Without this, these builds
-            // would stay "Busy" in the DB forever.
-            //
-            // We drain the freed_jobs, then re-insert each one before calling
-            // fail_step — fail_step's internal lookup expects to find the job
-            // via take_freed_job_by_drv on the same machine.
-            let freed = m.drain_freed_jobs();
-            for job in freed {
-                let drv = job.path.clone();
-                m.reinsert_freed_job(job);
-                if let Err(e) = self
-                    .fail_step(
-                        machine_id,
-                        &drv,
-                        BuildResultState::Aborted,
-                        BuildTimings::default(),
-                        None,
-                    )
-                    .await
-                {
-                    tracing::error!(
-                        "Failed to fail freed step machine_id={machine_id} drv={drv} e={e}",
-                    );
-                }
+        // Also fail jobs whose slot was already freed (SlotFreed sent,
+        // CompleteBuild not yet received).  Without this, these builds
+        // would stay "Busy" in the DB forever.
+        //
+        // We drain the freed_jobs, then re-insert each one before calling
+        // fail_step — fail_step's internal lookup expects to find the job
+        // via take_freed_job_by_drv on the same machine.
+        let freed = m.drain_freed_jobs();
+        for job in freed {
+            let drv = job.path.clone();
+            m.reinsert_freed_job(job);
+            if let Err(e) = self
+                .fail_step(
+                    machine_id,
+                    &drv,
+                    BuildResultState::Aborted,
+                    BuildTimings::default(),
+                    None,
+                )
+                .await
+            {
+                tracing::error!(
+                    "Failed to fail freed step machine_id={machine_id} drv={drv} e={e}",
+                );
             }
         }
     }
