@@ -54,9 +54,7 @@ struct FixedOutputDrvs {
 fn private_store_guard() -> PathBuf {
     let root = std::env::var_os("HYDRA_QUEUE_TEST_STORE")
         .expect("test driver must select a private Nix store");
-    let root = PathBuf::from(root)
-        .canonicalize()
-        .expect("private test-store root must exist");
+    let root = fs_err::canonicalize(root).expect("private test-store root must exist");
     assert!(root.is_absolute(), "private store root must be absolute");
     assert!(
         !root.starts_with("/nix"),
@@ -143,8 +141,8 @@ fn require_success(output: &std::process::Output, operation: &str) {
         output.status.success(),
         "{operation} failed: status={} stdout={} stderr={}",
         output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+        String::from_utf8(output.stdout.clone()).expect("command stdout is UTF-8"),
+        String::from_utf8(output.stderr.clone()).expect("command stderr is UTF-8")
     );
 }
 
@@ -159,8 +157,8 @@ fn create_fixed_output_drvs(
     let root_file = directory.join(&root_name);
     fs_err::write(&root_file, root_content).expect("write fixed root output fixture");
 
-    let root_file_expr = serde_json::to_string(&root_file.to_string_lossy().to_string())
-        .expect("encode root fixture path");
+    let root_file_expr =
+        serde_json::to_string(&root_file.display().to_string()).expect("encode root fixture path");
     let dependent_name = format!("pending-dependent-{suffix}");
     let expression = format!(
         r#"
@@ -223,7 +221,7 @@ fn create_fixed_output_drvs(
 }
 
 fn add_fixed_output(file: &Path, store_dir: &StoreDir) -> StorePath {
-    let file = file.to_string_lossy().to_string();
+    let file = file.display().to_string();
     let output = command_output("nix-store", &["--add-fixed", "sha256", &file]);
     require_success(
         &output,
@@ -255,14 +253,14 @@ async fn new_state(
             "queueTriggerTimerInS = 0\n",
             "stopQueueRunAfterInS = 0\n",
         ),
-        data_dir.to_string_lossy(),
+        data_dir.display(),
         database_url,
-        roots_dir.to_string_lossy()
+        roots_dir.display()
     );
     fs_err::write(&config_path, config)?;
     fs_err::create_dir_all(&data_dir)?;
 
-    let app = App::init(&config_path.to_string_lossy())?;
+    let app = App::init(&config_path.display().to_string())?;
     let db = db::Database::new(database_url, 4).await?;
     let log_dir = app.get_hydra_log_dir();
     fs_err::create_dir_all(&log_dir)?;
@@ -303,11 +301,7 @@ async fn new_state(
         metrics: PromMetrics::new()?,
         notify_dispatch: tokio::sync::Notify::new(),
         uploader: Arc::new(
-            Uploader::new(
-                data_dir.join("uploader_state.json"),
-                upload_completion_tx,
-            )
-            .await,
+            Uploader::new(data_dir.join("uploader_state.json"), upload_completion_tx).await,
         ),
         upload_completion_rx: parking_lot::Mutex::new(Some(upload_completion_rx)),
         real_store_dir,
@@ -505,9 +499,9 @@ async fn assert_scheduled_on_builder(state: &State, drv: &StorePath) {
         .find(|item| item.step.get_drv_path() == drv)
         .expect("step remains in the scheduled builder queue");
     assert!(step_info.get_already_scheduled());
-    let stats = state.queues.get_stats_per_queue().await;
+    let queue_stats = state.queues.get_stats_per_queue().await;
     assert_eq!(
-        stats["x86_64-linux"].active_runnable, 1,
+        queue_stats["x86_64-linux"].active_runnable, 1,
         "the builder assignment still owns an active queue slot"
     );
 }
@@ -521,10 +515,10 @@ async fn cached_output_recheck_finishes_root_and_releases_dependent() {
         std::env::var_os("LOGNAME").is_some(),
         "test driver must provide LOGNAME for Hydra config"
     );
-    let _directory = TestDirectory::new("cached-output-recheck");
-    let fixtures = create_fixed_output_drvs(_directory.path(), "dependency", &store_dir);
+    let directory = TestDirectory::new("cached-output-recheck");
+    let fixtures = create_fixed_output_drvs(directory.path(), "dependency", &store_dir);
     let (pg, pool) = test_utils::TestPg::new().await;
-    let state = new_state(_directory.path(), &pg.url(), &store_dir)
+    let state = Box::pin(new_state(directory.path(), &pg.url(), &store_dir))
         .await
         .expect("construct test state");
     let ids = insert_test_builds(
@@ -539,8 +533,20 @@ async fn cached_output_recheck_finishes_root_and_releases_dependent() {
     .await;
     assert_eq!(ids.len(), 2);
 
-    assert!(!state.store.is_valid_path(&fixtures.root_output).await.expect("store must answer validity"));
-    assert!(!state.store.is_valid_path(&fixtures.dependent_output).await.expect("store must answer validity"));
+    assert!(
+        !state
+            .store
+            .is_valid_path(&fixtures.root_output)
+            .await
+            .expect("store must answer validity")
+    );
+    assert!(
+        !state
+            .store
+            .is_valid_path(&fixtures.dependent_output)
+            .await
+            .expect("store must answer validity")
+    );
     state
         .get_queued_builds()
         .await
@@ -551,10 +557,16 @@ async fn cached_output_recheck_finishes_root_and_releases_dependent() {
     assert!(initial_runnable.contains(&fixtures.root_drv));
     assert!(!initial_runnable.contains(&fixtures.dependent_drv));
 
-    let root_file = _directory.path().join("cached-root-dependency");
+    let root_file = directory.path().join("cached-root-dependency");
     let added_root = add_fixed_output(&root_file, &store_dir);
     assert_eq!(added_root, fixtures.root_output);
-    assert!(state.store.is_valid_path(&fixtures.root_output).await.expect("store must answer validity"));
+    assert!(
+        state
+            .store
+            .is_valid_path(&fixtures.root_output)
+            .await
+            .expect("store must answer validity")
+    );
 
     state
         .get_queued_builds()
@@ -574,7 +586,13 @@ async fn cached_output_recheck_finishes_root_and_releases_dependent() {
         }
     );
     assert_eq!(build_db_state(&pool, ids[1]).await.finished, 0);
-    assert!(!state.store.is_valid_path(&fixtures.dependent_output).await.expect("store must answer validity"));
+    assert!(
+        !state
+            .store
+            .is_valid_path(&fixtures.dependent_output)
+            .await
+            .expect("store must answer validity")
+    );
     let released = runnable_paths(&state);
     assert!(released.contains(&fixtures.dependent_drv));
     let eligible = unfinished_runnable_paths(&state);
@@ -591,7 +609,7 @@ async fn missing_output_remains_pending_on_recheck() {
     let directory = TestDirectory::new("missing-output-control");
     let fixtures = create_fixed_output_drvs(directory.path(), "missing-control", &store_dir);
     let (pg, pool) = test_utils::TestPg::new().await;
-    let state = new_state(directory.path(), &pg.url(), &store_dir)
+    let state = Box::pin(new_state(directory.path(), &pg.url(), &store_dir))
         .await
         .expect("construct test state");
     let ids = insert_test_builds(
@@ -610,7 +628,13 @@ async fn missing_output_remains_pending_on_recheck() {
         .await
         .expect("recheck still-missing output");
     assert_eq!(build_db_state(&pool, ids[0]).await.finished, 0);
-    assert!(!state.store.is_valid_path(&fixtures.root_output).await.expect("store must answer validity"));
+    assert!(
+        !state
+            .store
+            .is_valid_path(&fixtures.root_output)
+            .await
+            .expect("store must answer validity")
+    );
     assert!(runnable_paths(&state).contains(&fixtures.root_drv));
 }
 
@@ -623,7 +647,7 @@ async fn new_step_still_honors_failedpaths_record() {
     let directory = TestDirectory::new("failedpaths-control");
     let fixtures = create_fixed_output_drvs(directory.path(), "failedpaths-control", &store_dir);
     let (pg, pool) = test_utils::TestPg::new().await;
-    let state = new_state(directory.path(), &pg.url(), &store_dir)
+    let state = Box::pin(new_state(directory.path(), &pg.url(), &store_dir))
         .await
         .expect("construct test state");
     let ids = insert_test_builds(
@@ -634,7 +658,11 @@ async fn new_step_still_honors_failedpaths_record() {
     )
     .await;
     insert_previous_failed_build(&pool, state.store.store_dir(), ids[0], &fixtures.root_drv).await;
-    let output_path = state.store.store_dir().display(&fixtures.root_output).to_string();
+    let output_path = state
+        .store
+        .store_dir()
+        .display(&fixtures.root_output)
+        .to_string();
     sqlx::query("INSERT INTO failedpaths (path) VALUES ($1)")
         .bind(output_path)
         .execute(&pool)
@@ -670,9 +698,10 @@ async fn existing_step_still_honors_failedpaths_record() {
     let store_dir = init_private_store(&private_root);
     assert!(std::env::var_os("LOGNAME").is_some());
     let directory = TestDirectory::new("existing-failedpaths-control");
-    let fixtures = create_fixed_output_drvs(directory.path(), "existing-failedpaths-control", &store_dir);
+    let fixtures =
+        create_fixed_output_drvs(directory.path(), "existing-failedpaths-control", &store_dir);
     let (pg, pool) = test_utils::TestPg::new().await;
-    let state = new_state(directory.path(), &pg.url(), &store_dir)
+    let state = Box::pin(new_state(directory.path(), &pg.url(), &store_dir))
         .await
         .expect("construct test state");
     let ids = insert_test_builds(
@@ -696,7 +725,11 @@ async fn existing_step_still_honors_failedpaths_record() {
         .join("cached-root-existing-failedpaths-control");
     let added_root = add_fixed_output(&root_file, &store_dir);
     assert_eq!(added_root, fixtures.root_output);
-    let output_path = state.store.store_dir().display(&fixtures.root_output).to_string();
+    let output_path = state
+        .store
+        .store_dir()
+        .display(&fixtures.root_output)
+        .to_string();
     sqlx::query("INSERT INTO failedpaths (path) VALUES ($1)")
         .bind(output_path)
         .execute(&pool)
@@ -734,7 +767,7 @@ async fn cached_output_recheck_defers_until_scheduled_item_is_dropped() {
     let directory = TestDirectory::new("scheduled-output-control");
     let fixtures = create_fixed_output_drvs(directory.path(), "scheduled-control", &store_dir);
     let (pg, pool) = test_utils::TestPg::new().await;
-    let state = new_state(directory.path(), &pg.url(), &store_dir)
+    let state = Box::pin(new_state(directory.path(), &pg.url(), &store_dir))
         .await
         .expect("construct test state");
     let ids = insert_test_builds(
@@ -791,7 +824,7 @@ async fn dispatch_in_progress_defers_cached_output_recheck() {
     let directory = TestDirectory::new("dispatch-claim-control");
     let fixtures = create_fixed_output_drvs(directory.path(), "dispatch-claim-control", &store_dir);
     let (pg, pool) = test_utils::TestPg::new().await;
-    let state = new_state(directory.path(), &pg.url(), &store_dir)
+    let state = Box::pin(new_state(directory.path(), &pg.url(), &store_dir))
         .await
         .expect("construct test state");
     let ids = insert_test_builds(
