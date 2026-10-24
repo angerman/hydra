@@ -11,12 +11,21 @@ use super::drv::flatten_chain;
 use crate::config::StepSortFn;
 
 /// Resolve an input-addressed derivation output from the `.drv` file on
-/// disk. The build-history lookup in the database can miss outputs that
-/// never got a successful build step row, e.g. paths that were already
-/// valid when the step was created or whose step was aborted by a
-/// restart after the build finished. For input-addressed derivations the
-/// output path is fixed by the derivation itself, so the file is
-/// authoritative.
+/// disk.
+///
+/// The build-history lookup in the database can miss outputs that never
+/// got a successful build step row, e.g. paths that were already valid
+/// when the step was created or whose step was aborted by a restart
+/// after the build finished. Worse, historical rows can actively
+/// mislabel an output: distinct steps of one build have recorded
+/// different paths (e.g. a `doc` path) under the same `out` name, and
+/// the SQL lookup orders by build only, so it can return the wrong path
+/// even when a row exists. For input-addressed derivations the output
+/// path is fixed by the derivation itself, so the file is authoritative
+/// and must be consulted before trusting any database row.
+///
+/// Returns [`None`] for dynamic outputs (`Deferred`, `CAFloating`,
+/// `Impure`), which declare no path, and when the file cannot be read.
 fn resolve_from_drv_file(
     store_dir: &StoreDir,
     drv_path: &StorePath,
@@ -31,6 +40,49 @@ fn resolve_from_drv_file(
         .path(store_dir, &drv.name, output_name)
         .ok()
         .flatten()
+}
+
+/// Resolve each link from its immutable declaration before consulting
+/// build history. A DB-only link must not make a later fixed link trust
+/// history, and a fixed link must select the next drv before a DB lookup.
+fn resolve_chain(
+    root: &StorePath,
+    outputs: &[&OutputName],
+    mut declared: impl FnMut(&StorePath, &OutputName) -> Option<StorePath>,
+    mut history: impl FnMut(&StorePath, &OutputName) -> Option<StorePath>,
+) -> Option<StorePath> {
+    let mut current = root.clone();
+    for output_name in outputs {
+        current = declared(&current, output_name).or_else(|| history(&current, output_name))?;
+    }
+    Some(current)
+}
+
+/// `flatten_chain` appends each outer output to the root-first vector.
+/// Consume that order directly; reversing it swaps distinct nested names.
+fn resolve_input(
+    drv_path: &SingleDerivedPath,
+    output_name: &OutputName,
+    declared: impl FnMut(&StorePath, &OutputName) -> Option<StorePath>,
+    history: impl FnMut(&StorePath, &OutputName) -> Option<StorePath>,
+) -> Option<StorePath> {
+    let (root, chain) = flatten_chain(drv_path, output_name);
+    let outputs: Vec<_> = chain.0.iter().collect();
+    resolve_chain(&root, &outputs, declared, history)
+}
+
+#[cfg(test)]
+fn resolve_chain_from_drv_files(
+    store_dir: &StoreDir,
+    root: &StorePath,
+    outputs: &[&OutputName],
+) -> Option<StorePath> {
+    resolve_chain(
+        root,
+        outputs,
+        |path, output| resolve_from_drv_file(store_dir, path, output),
+        |_, _| None,
+    )
 }
 
 #[derive(Debug)]
@@ -56,14 +108,15 @@ impl StepInfo {
     /// Resolve a derivation's inputs into concrete store paths, returning a
     /// [`BasicDerivation`](BasicDerivation).
     ///
-    /// Returns [`None`] if the derivation is input-addressed (shouldn't be resolved),
-    /// or if resolution fails because required outputs haven't been built yet.
+    /// Returns [`None`] if a required output cannot be resolved from its
+    /// declaration or build history.
     ///
     /// If the derivation has no [`Built`](SingleDerivedPath::Built) inputs, it is
     /// already resolved; the inputs are simply flattened to a [`StorePathSet`].
     ///
-    /// We only need a store dir, not a store, because all the info we need comes from the Hydra
-    /// database.
+    /// We only need a store dir, not a store, because all the info we
+    /// need comes from the Hydra database and the `.drv` files in the
+    /// store dir.
     pub(super) async fn try_resolve_force(
         store_dir: &StoreDir,
         db: &db::Database,
@@ -90,63 +143,27 @@ impl StepInfo {
 
         drv.try_resolve_force(store_dir, &mut |inputs| {
             tokio::task::block_in_place(|| {
-                // Flatten each SingleDerivedPath chain into (root, [outputs...])
-                // and resolve everything in a single recursive SQL query.
-                let chains: Vec<_> = inputs
-                    .iter()
-                    .map(|(drv_path, output_name)| flatten_chain(drv_path, output_name))
-                    .collect();
-
-                // SQL needs forward order; OutputNameChain stores reversed.
-                let chain_refs: Vec<_> = chains
-                    .iter()
-                    .map(|(root, chain)| (root, chain.0.iter().rev().collect::<Vec<_>>()))
-                    .collect();
-
-                let sql_input: Vec<_> = chain_refs
-                    .iter()
-                    .map(|(root, outputs)| (*root, outputs.as_slice()))
-                    .collect();
-
                 let rt = tokio::runtime::Handle::current();
-                let results = rt
-                    .block_on(conn.resolve_drv_output_chains(store_dir, &sql_input))
-                    .unwrap_or_else(|e| {
-                        tracing::warn!("resolve_drv_output_chains failed: {e}");
-                        vec![None; inputs.len()]
-                    });
-
-                // The build-history lookup can miss outputs that never got
-                // a successful build step row. For chains the SQL couldn't
-                // resolve, retry link by link, falling back to reading the
-                // `.drv` file, which is authoritative for input-addressed
-                // derivations. The per-link DB lookup matters too: a chain
-                // can mix links known only to the DB with links whose drv
-                // only exists on disk, and the recursive SQL stops at the
-                // first miss.
-                results
-                    .into_iter()
-                    .zip(&chain_refs)
-                    .map(|(result, (root, outputs))| {
-                        result.or_else(|| {
-                            let mut current = (*root).clone();
-                            for output_name in outputs {
-                                current = rt
-                                    .block_on(conn.resolve_drv_output(
-                                        store_dir,
-                                        &current,
-                                        output_name,
-                                    ))
+                inputs
+                    .iter()
+                    .map(|(drv_path, output_name)| {
+                        resolve_input(
+                            drv_path,
+                            output_name,
+                            |path, output| resolve_from_drv_file(store_dir, path, output),
+                            |path, output| {
+                                let names = [output];
+                                let chain = [(path, names.as_slice())];
+                                // Keep the alias/status-13 handling of the recursive
+                                // resolver, but resolve only this one unknown link.
+                                rt.block_on(conn.resolve_drv_output_chains(store_dir, &chain))
+                                    .map(|paths| paths.into_iter().next().flatten())
                                     .unwrap_or_else(|e| {
-                                        tracing::warn!("resolve_drv_output failed: {e}");
+                                        tracing::warn!("resolve_drv_output_chains failed: {e}");
                                         None
                                     })
-                                    .or_else(|| {
-                                        resolve_from_drv_file(store_dir, &current, output_name)
-                                    })?;
-                            }
-                            Some(current)
-                        })
+                            },
+                        )
                     })
                     .collect()
             })
@@ -263,6 +280,28 @@ mod tests {
     use super::*;
     use db::models::BuildID;
     use std::cmp::Ordering::{Equal, Greater, Less};
+
+    /// Write a minimal `.drv` file with the given ATerm body into a
+    /// scratch store dir. The body may contain `{store}`, which is
+    /// replaced with the scratch dir since ATerm embeds absolute store
+    /// paths. The returned guard keeps the dir alive.
+    fn scratch_drv(
+        drv_hash: &str,
+        drv_name: &str,
+        aterm: &str,
+    ) -> (tempfile::TempDir, StoreDir, StorePath) {
+        let dir = tempfile::tempdir().expect("scratch store dir");
+        let store_dir = StoreDir::new(dir.path()).expect("scratch store dir is absolute");
+        let drv_path: StorePath = format!("{drv_hash}-{drv_name}.drv").parse().unwrap();
+        let aterm = aterm.replace("{store}", &dir.path().display().to_string());
+        std::fs::write(dir.path().join(format!("{drv_hash}-{drv_name}.drv")), aterm)
+            .expect("write scratch .drv file");
+        (dir, store_dir, drv_path)
+    }
+
+    fn drv_aterm(outputs: &str, name: &str) -> String {
+        format!("Derive([{outputs}],[],[],\"x86_64-linux\",\"/bin/sh\",[],[(\"name\",\"{name}\")])")
+    }
 
     fn cmp(a: &StepInfo, b: &StepInfo, sort_fn: StepSortFn) -> std::cmp::Ordering {
         a.sort_key(sort_fn).cmp(&b.sort_key(sort_fn))
@@ -410,5 +449,226 @@ mod tests {
 
         assert_eq!(cmp(&step1, &step2, StepSortFn::WithRdeps), Less);
         assert_eq!(cmp(&step2, &step1, StepSortFn::WithRdeps), Greater);
+    }
+
+    /// Mirrors the production git/alex misresolution: the derivation's
+    /// `.drv` file declares `out` as the real output path while
+    /// historical buildstepoutputs rows label a different (`doc`/`data`)
+    /// path under the same `out` name. The declared file path must win
+    /// over any database row; `doc` still resolves under its own name.
+    #[test]
+    fn drv_file_selects_declared_out_despite_mislabeled_history() {
+        let drv_hash = "a".repeat(32);
+        let out_hash = "b".repeat(32);
+        let doc_hash = "c".repeat(32);
+        let aterm = drv_aterm(
+            &format!(
+                "(\"out\",\"{{store}}/{out_hash}-declared-lib\",\"\",\"\"),\
+                 (\"doc\",\"{{store}}/{doc_hash}-declared-lib-doc\",\"\",\"\")"
+            ),
+            "declared-lib",
+        );
+        let (_guard, store_dir, drv_path) = scratch_drv(&drv_hash, "declared-lib", &aterm);
+
+        let out: OutputName = "out".parse().unwrap();
+        let doc: OutputName = "doc".parse().unwrap();
+        let real: StorePath = format!("{out_hash}-declared-lib").parse().unwrap();
+        let doc_path: StorePath = format!("{doc_hash}-declared-lib-doc").parse().unwrap();
+
+        // Declared paths resolve straight from the file, no database.
+        assert_eq!(
+            resolve_from_drv_file(&store_dir, &drv_path, &out),
+            Some(real.clone())
+        );
+        assert_eq!(
+            resolve_from_drv_file(&store_dir, &drv_path, &doc),
+            Some(doc_path.clone())
+        );
+        // The chain walk used ahead of the SQL lookup agrees.
+        assert_eq!(
+            resolve_chain_from_drv_files(&store_dir, &drv_path, &[&out]),
+            Some(real.clone())
+        );
+        // In particular the `doc` path is never returned for `out`.
+        assert_ne!(
+            resolve_chain_from_drv_files(&store_dir, &drv_path, &[&out]),
+            Some(doc_path)
+        );
+    }
+
+    /// A depth-2 chain walks link by link through the files: the root
+    /// drv's `out` names an intermediate `.drv`, whose `lib` output is
+    /// the final path.
+    #[test]
+    fn drv_file_chain_walks_intermediate_drv() {
+        let mid_hash = "d".repeat(32);
+        let (guard, store_dir, _) = scratch_drv(
+            &mid_hash,
+            "mid",
+            &drv_aterm(
+                &format!("(\"lib\",\"{{store}}/{mid_hash}-final\",\"\",\"\")"),
+                "mid",
+            ),
+        );
+        // The second link lives in the same scratch store dir.
+        let root_hash = "f".repeat(32);
+        let root_aterm = drv_aterm(
+            &format!("(\"out\",\"{{store}}/{mid_hash}-mid.drv\",\"\",\"\")"),
+            "root",
+        )
+        .replace("{store}", store_dir.to_str());
+        let root_path: StorePath = format!("{root_hash}-root.drv").parse().unwrap();
+        std::fs::write(
+            guard.path().join(format!("{root_hash}-root.drv")),
+            &root_aterm,
+        )
+        .expect("write root .drv file");
+
+        let out: OutputName = "out".parse().unwrap();
+        let lib: OutputName = "lib".parse().unwrap();
+        let expected: StorePath = format!("{mid_hash}-final").parse().unwrap();
+        assert_eq!(
+            resolve_chain_from_drv_files(&store_dir, &root_path, &[&out, &lib]),
+            Some(expected)
+        );
+    }
+
+    /// Dynamic outputs declare no path, so the file walk stays silent
+    /// and those links keep resolving through the database. The same
+    /// holds when the `.drv` file is absent from the store.
+    #[test]
+    fn drv_file_silent_for_dynamic_or_missing_drv() {
+        let out: OutputName = "out".parse().unwrap();
+        for (label, outputs) in [
+            ("deferred", "(\"out\",\"\",\"\",\"\")"),
+            ("floating", "(\"out\",\"\",\"r:sha256\",\"\")"),
+            ("impure", "(\"out\",\"\",\"r:sha256\",\"impure\")"),
+        ] {
+            let drv_hash = "a".repeat(32);
+            let aterm = drv_aterm(outputs, label);
+            let (_guard, store_dir, drv_path) = scratch_drv(&drv_hash, label, &aterm);
+            assert_eq!(
+                resolve_from_drv_file(&store_dir, &drv_path, &out),
+                None,
+                "{label} declares no path"
+            );
+            assert_eq!(
+                resolve_chain_from_drv_files(&store_dir, &drv_path, &[&out]),
+                None,
+                "{label} chain falls back to the database"
+            );
+        }
+
+        // Missing file: both helpers stay silent.
+        let present_hash = "a".repeat(32);
+        let present_aterm = drv_aterm("(\"out\",\"\",\"\",\"\")", "present");
+        let (_guard, store_dir, _) = scratch_drv(&present_hash, "present", &present_aterm);
+        let absent_hash = "b".repeat(32);
+        let absent: StorePath = format!("{absent_hash}-absent.drv").parse().unwrap();
+        assert_eq!(resolve_from_drv_file(&store_dir, &absent, &out), None);
+        assert_eq!(
+            resolve_chain_from_drv_files(&store_dir, &absent, &[&out]),
+            None
+        );
+    }
+
+    #[test]
+    fn db_only_link_does_not_override_a_later_declared_output() {
+        let path = |name| {
+            format!("{}-{name}", "a".repeat(32))
+                .parse::<StorePath>()
+                .unwrap()
+        };
+        let root = path("dynamic.drv");
+        let middle = path("middle.drv");
+        let real = path("real");
+        let decoy = path("decoy");
+        let out: OutputName = "out".parse().unwrap();
+        let mut history_calls = Vec::new();
+
+        let resolved = resolve_chain(
+            &root,
+            &[&out, &out],
+            |drv, _| (drv == &middle).then(|| real.clone()),
+            |drv, _| {
+                history_calls.push(drv.clone());
+                Some(if drv == &root {
+                    middle.clone()
+                } else {
+                    decoy.clone()
+                })
+            },
+        );
+        assert_eq!(resolved, Some(real));
+        assert_eq!(history_calls, vec![root]);
+    }
+
+    #[test]
+    fn declared_link_selects_the_drv_for_a_later_db_only_output() {
+        let path = |name| {
+            format!("{}-{name}", "b".repeat(32))
+                .parse::<StorePath>()
+                .unwrap()
+        };
+        let root = path("root.drv");
+        let middle = path("dynamic.drv");
+        let real = path("real");
+        let wrong_middle = path("wrong.drv");
+        let out: OutputName = "out".parse().unwrap();
+        let mut history_calls = Vec::new();
+
+        let resolved = resolve_chain(
+            &root,
+            &[&out, &out],
+            |drv, _| (drv == &root).then(|| middle.clone()),
+            |drv, _| {
+                history_calls.push(drv.clone());
+                if drv == &root {
+                    Some(wrong_middle.clone())
+                } else if drv == &middle {
+                    Some(real.clone())
+                } else {
+                    None
+                }
+            },
+        );
+        assert_eq!(resolved, Some(real));
+        assert_eq!(history_calls, vec![middle]);
+    }
+
+    #[test]
+    fn nested_input_resolves_distinct_output_names_from_root_to_leaf() {
+        let path = |name| {
+            format!("{}-{name}", "c".repeat(32))
+                .parse::<StorePath>()
+                .unwrap()
+        };
+        let root = path("root.drv");
+        let middle = path("middle.drv");
+        let final_path = path("final");
+        let foo: OutputName = "foo".parse().unwrap();
+        let bar: OutputName = "bar".parse().unwrap();
+        let nested = SingleDerivedPath::Built {
+            drv_path: Arc::new(SingleDerivedPath::Opaque(root.clone())),
+            output: foo.clone(),
+        };
+        let mut lookups = Vec::new();
+        let result = resolve_input(
+            &nested,
+            &bar,
+            |_, _| None,
+            |drv, output| {
+                lookups.push((drv.clone(), output.clone()));
+                if drv == &root && output == &foo {
+                    Some(middle.clone())
+                } else if drv == &middle && output == &bar {
+                    Some(final_path.clone())
+                } else {
+                    None
+                }
+            },
+        );
+        assert_eq!(result, Some(final_path));
+        assert_eq!(lookups, vec![(root, foo), (middle, bar)]);
     }
 }

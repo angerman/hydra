@@ -876,3 +876,195 @@ async fn dispatch_in_progress_defers_cached_output_recheck() {
     assert_eq!(build_db_state(&pool, ids[0]).await.finished, 0);
     assert_scheduled_on_builder(&state, &fixtures.root_drv).await;
 }
+
+struct DeclaredInputDrvs {
+    lib_drv: StorePath,
+    lib_output: StorePath,
+    decoy_output: StorePath,
+    consumer_drv: StorePath,
+}
+
+/// Instantiate a single-output `lib` derivation, an unrelated `decoy`
+/// derivation, and a `consumer` whose only build input is `lib`'s `out`.
+fn create_declared_input_drvs(store_dir: &StoreDir, suffix: &str) -> DeclaredInputDrvs {
+    let lib_name = format!("declared-lib-{suffix}");
+    let decoy_name = format!("declared-decoy-{suffix}");
+    let consumer_name = format!("declared-consumer-{suffix}");
+    let expression = format!(
+        r#"
+        let
+          lib = derivation {{
+            name = "{lib_name}";
+            system = builtins.currentSystem;
+            builder = "/bin/sh";
+            args = [ "-c" "exit 1" ];
+          }};
+          decoy = derivation {{
+            name = "{decoy_name}";
+            system = builtins.currentSystem;
+            builder = "/bin/sh";
+            args = [ "-c" "exit 1" ];
+          }};
+          consumer = derivation {{
+            name = "{consumer_name}";
+            system = builtins.currentSystem;
+            builder = "/bin/sh";
+            args = [ "-c" "exit 1" ];
+            libInput = lib;
+          }};
+        in {{
+          libDrv = lib.drvPath;
+          libOutput = lib.outPath;
+          decoyOutput = decoy.outPath;
+          consumerDrv = consumer.drvPath;
+        }}
+        "#
+    );
+
+    let expression_output = command_output(
+        "nix-instantiate",
+        &[
+            "--eval",
+            "--json",
+            "--strict",
+            "--read-write-mode",
+            "--expr",
+            &expression,
+        ],
+    );
+    require_success(
+        &expression_output,
+        "evaluate declared-input test derivations",
+    );
+    let paths: serde_json::Value =
+        serde_json::from_slice(&expression_output.stdout).expect("decode derivation paths");
+    let parse = |field: &str| {
+        store_dir
+            .parse(
+                paths[field]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("Nix omitted {field}")),
+            )
+            .expect("Nix reported an unparseable store path")
+    };
+
+    DeclaredInputDrvs {
+        lib_drv: parse("libDrv"),
+        lib_output: parse("libOutput"),
+        decoy_output: parse("decoyOutput"),
+        consumer_drv: parse("consumerDrv"),
+    }
+}
+
+async fn insert_success_output(
+    pool: &sqlx::PgPool,
+    store_dir: &StoreDir,
+    build_id: i32,
+    drv_path: &StorePath,
+    name: &str,
+    path: &StorePath,
+) {
+    sqlx::query(
+        "INSERT INTO buildsteps \
+         (build, stepnr, type, drvpath, busy, status, starttime, stoptime, machine, system) \
+         VALUES ($1, 1, 0, $2, 0, 0, 1, 2, '', 'x86_64-linux')",
+    )
+    .bind(build_id)
+    .bind(store_dir.display(drv_path).to_string())
+    .execute(pool)
+    .await
+    .expect("insert test buildstep");
+    sqlx::query("INSERT INTO buildstepoutputs (build, stepnr, name, path) VALUES ($1, 1, $2, $3)")
+        .bind(build_id)
+        .bind(name)
+        .bind(store_dir.display(path).to_string())
+        .execute(pool)
+        .await
+        .expect("insert test buildstepoutput");
+}
+
+fn read_test_derivation(
+    store_dir: &StoreDir,
+    drv_path: &StorePath,
+) -> harmonia_store_derivation::derivation::Derivation {
+    let content = fs_err::read(store_dir.display(drv_path).to_string())
+        .expect("read test .drv file from the private store");
+    let name = drv_path
+        .name()
+        .to_string()
+        .strip_suffix(".drv")
+        .expect("test drv name ends in `.drv`")
+        .parse()
+        .expect("parse test derivation name");
+    harmonia_store_aterm::parse_derivation_aterm(store_dir, &content, name)
+        .expect("parse test derivation")
+}
+
+/// End-to-end proof of the declared-input misresolution: the `lib`
+/// derivation's `.drv` file declares its real `out` path, while the
+/// *newer* historical buildstep row mislabels the decoy path under the
+/// same `out` name (the production git/alex rows label the `doc`/`data`
+/// path `out`). The build-ordered SQL lookup alone returns the decoy;
+/// resolution must return the declared path instead.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires an explicitly guarded private Nix store and TestPg"]
+async fn declared_input_resolution_prefers_drv_file_over_mislabeled_history() {
+    let private_root = private_store_guard();
+    let store_dir = init_private_store(&private_root);
+    let fixtures = create_declared_input_drvs(&store_dir, "mislabeled");
+    let (pg, pool) = test_utils::TestPg::new().await;
+    let db = db::Database::new(&pg.url(), 4)
+        .await
+        .expect("connect test database");
+    let ids = insert_test_builds(
+        &pool,
+        &store_dir,
+        "mislabeled",
+        &[
+            ("lib-old", &fixtures.lib_drv),
+            ("lib-new", &fixtures.lib_drv),
+            ("consumer", &fixtures.consumer_drv),
+        ],
+    )
+    .await;
+    // Older build recorded the true declared output ...
+    insert_success_output(
+        &pool,
+        &store_dir,
+        ids[0],
+        &fixtures.lib_drv,
+        "out",
+        &fixtures.lib_output,
+    )
+    .await;
+    // ... but a newer build mislabels the decoy path under `out`.
+    insert_success_output(
+        &pool,
+        &store_dir,
+        ids[1],
+        &fixtures.lib_drv,
+        "out",
+        &fixtures.decoy_output,
+    )
+    .await;
+
+    let consumer_drv = read_test_derivation(&store_dir, &fixtures.consumer_drv);
+    let resolved = StepInfo::try_resolve_force(&store_dir, &db, &consumer_drv)
+        .await
+        .expect("declared consumer input resolves");
+    assert_eq!(
+        resolved.inputs.len(),
+        1,
+        "the consumer has exactly one build input"
+    );
+    let declared = store_dir.display(&fixtures.lib_output).to_string();
+    let decoy = store_dir.display(&fixtures.decoy_output).to_string();
+    assert!(
+        resolved.inputs.contains(&fixtures.lib_output),
+        "resolution selects the declared lib output {declared}, not the mislabeled row"
+    );
+    assert!(
+        !resolved.inputs.contains(&fixtures.decoy_output),
+        "resolution must not return the mislabeled decoy path {decoy}"
+    );
+}

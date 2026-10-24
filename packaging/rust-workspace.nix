@@ -127,7 +127,7 @@ let
         postgresql_17
         nixCli
       ];
-      cargoNextestExtraArgs = "--run-ignored ignored-only -p hydra-queue-runner --lib cached_output failedpaths_record missing_output_remains_pending_on_recheck";
+      cargoNextestExtraArgs = "--workspace --run-ignored ignored-only cached_output failedpaths_record missing_output_remains_pending_on_recheck";
       preCheck = ''
         export LOGNAME="$(id -un)"
         export HYDRA_QUEUE_TEST_STORE="$TMPDIR/queue-test-store"
