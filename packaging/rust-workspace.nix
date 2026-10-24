@@ -127,7 +127,10 @@ let
         postgresql_17
         nixCli
       ];
-      cargoNextestExtraArgs = "--workspace --run-ignored ignored-only cached_output failedpaths_record missing_output_remains_pending_on_recheck";
+      # The binary also includes `state`, duplicating these library tests.
+      # Running both copies concurrently shares fixed-output paths in the
+      # private store, so one copy can import the other copy's missing output.
+      cargoNextestExtraArgs = "--workspace --lib --run-ignored ignored-only cached_output failedpaths_record missing_output_remains_pending_on_recheck";
       preCheck = ''
         export LOGNAME="$(id -un)"
         export HYDRA_QUEUE_TEST_STORE="$TMPDIR/queue-test-store"
