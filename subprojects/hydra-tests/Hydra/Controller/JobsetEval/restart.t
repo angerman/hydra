@@ -31,7 +31,7 @@ ok(evalSucceeds($ctx{context}, $jobset), "Evaluating jobs/basic.nix should exit 
 is(nrQueuedBuildsForJobset($jobset), 3, "Evaluating jobs/basic.nix should result in 3 builds");
 
 my ($eval, @evals) = $jobset->jobsetevals;
-my ($abortedBuild, $failedBuild, @builds) = queuedBuildsForJobset($jobset);
+my ($abortedBuild, $failedBuild, $timedOutBuild) = queuedBuildsForJobset($jobset);
 
 isnt($eval, undef, "We have an evaluation to restart");
 
@@ -49,6 +49,16 @@ isnt($failedBuild, undef, "We should have the failed build to restart");
 $failedBuild->update({
     finished => 1,
     buildstatus => 5,
+    stoptime => 1,
+    starttime => 1,
+ });
+
+# Make the build time out: shown (and counted by BuildDiff) as aborted, so
+# "Restart all aborted builds" must restart it too.
+isnt($timedOutBuild, undef, "We should have the timed out build to restart");
+$timedOutBuild->update({
+    finished => 1,
+    buildstatus => 7,
     stoptime => 1,
     starttime => 1,
  });
@@ -76,6 +86,9 @@ subtest 'Restart all aborted JobsetEval builds' => sub {
 
     my $newAbortedBuild = $db->resultset('Builds')->find($abortedBuild->id);
     is($newAbortedBuild->finished, 0, "The aborted build is no longer finished");
+
+    my $newTimedOutBuild = $db->resultset('Builds')->find($timedOutBuild->id);
+    is($newTimedOutBuild->finished, 0, "The timed out build is no longer finished");
 
     my $newFailedBuild = $db->resultset('Builds')->find($failedBuild->id);
     is($newFailedBuild->finished, 1, "The failed build is still finished");

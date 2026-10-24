@@ -566,7 +566,8 @@ sub restartBuilds {
             });
     });
 
-    return $nrRestarted;
+    # update() returns "0E0" (zero but true) when no rows match.
+    return $nrRestarted + 0;
 }
 
 

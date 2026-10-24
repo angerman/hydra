@@ -132,7 +132,8 @@ sub restart {
 
 sub restart_aborted : Chained('evalChain') PathPart('restart-aborted') Args(0) {
     my ($self, $c) = @_;
-    restart($self, $c, { -in => [3, 4, 9] });
+    # The same statuses BuildDiff counts as aborted for the Actions menu.
+    restart($self, $c, { -in => [3, 4, 7, 9, 10] });
 }
 
 

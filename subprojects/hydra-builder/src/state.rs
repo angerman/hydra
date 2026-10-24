@@ -1183,10 +1183,10 @@ async fn import_paths(
         paths
     };
     let paths = if use_substitutes {
-        metrics.add_substituting_path(paths.len() as u64);
+        let substituting = metrics.substituting_paths(paths.len() as u64);
         // we can ignore the failed count: failures fall through to gRPC fetch below.
         let (_ok, _err) = substitute_paths(connector.clone(), paths.clone()).await;
-        metrics.sub_substituting_path(paths.len() as u64);
+        drop(substituting);
         let paths = filter_missing(pool, roots, paths, 10).await?;
         if paths.is_empty() {
             return Ok(());
@@ -1202,7 +1202,7 @@ async fn import_paths(
 
     let num_paths = paths.len() as u64;
     tracing::info!("Streaming {num_paths} paths from queue runner");
-    metrics.add_downloading_path(num_paths);
+    let _downloading = metrics.downloading_paths(num_paths);
 
     let stream = client
         .fetch_paths(hydra_proto::StorePaths {
@@ -1223,7 +1223,6 @@ async fn import_paths(
     }
     drop(conn);
 
-    metrics.sub_downloading_path(num_paths);
     tracing::info!(
         "Finished streaming {} paths from queue runner",
         imported.len()
@@ -1360,7 +1359,7 @@ async fn upload_nars_regular(
     let before_upload = Instant::now();
     let nars_len = closure.len() as u64;
 
-    metrics.add_uploading_path(nars_len);
+    let _uploading = metrics.uploading_paths(nars_len);
 
     let nars: Vec<_> = closure.iter().map(|vpi| vpi.path.clone()).collect();
     let infos: HashMap<_, _> = closure
@@ -1390,7 +1389,6 @@ async fn upload_nars_regular(
         before_upload.elapsed()
     );
 
-    metrics.sub_uploading_path(nars_len);
     Ok(())
 }
 

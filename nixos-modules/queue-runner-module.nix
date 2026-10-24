@@ -327,6 +327,9 @@ in
       ];
       wantedBy = [ "multi-user.target" ];
       reloadTriggers = [ config.environment.etc."hydra/queue-runner.toml".source ];
+      # Outputs are copied to non-S3 `remoteStoreAddr` stores with `nix copy`;
+      # without nix on PATH every copy fails with "No such file or directory".
+      path = [ config.nix.package ];
 
       environment = {
         NIX_REMOTE = "daemon";
