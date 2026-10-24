@@ -157,11 +157,13 @@ impl StepInfo {
                                 // Keep the alias/status-13 handling of the recursive
                                 // resolver, but resolve only this one unknown link.
                                 rt.block_on(conn.resolve_drv_output_chains(store_dir, &chain))
-                                    .map(|paths| paths.into_iter().next().flatten())
-                                    .unwrap_or_else(|e| {
-                                        tracing::warn!("resolve_drv_output_chains failed: {e}");
-                                        None
-                                    })
+                                    .map_or_else(
+                                        |e| {
+                                            tracing::warn!("resolve_drv_output_chains failed: {e}");
+                                            None
+                                        },
+                                        |paths| paths.into_iter().next().flatten(),
+                                    )
                             },
                         )
                     })
@@ -281,9 +283,9 @@ mod tests {
     use db::models::BuildID;
     use std::cmp::Ordering::{Equal, Greater, Less};
 
-    /// Write a minimal `.drv` file with the given ATerm body into a
+    /// Write a minimal `.drv` file with the given `ATerm` body into a
     /// scratch store dir. The body may contain `{store}`, which is
-    /// replaced with the scratch dir since ATerm embeds absolute store
+    /// replaced with the scratch dir since `ATerm` embeds absolute store
     /// paths. The returned guard keeps the dir alive.
     fn scratch_drv(
         drv_hash: &str,
@@ -294,7 +296,7 @@ mod tests {
         let store_dir = StoreDir::new(dir.path()).expect("scratch store dir is absolute");
         let drv_path: StorePath = format!("{drv_hash}-{drv_name}.drv").parse().unwrap();
         let aterm = aterm.replace("{store}", &dir.path().display().to_string());
-        std::fs::write(dir.path().join(format!("{drv_hash}-{drv_name}.drv")), aterm)
+        fs_err::write(dir.path().join(format!("{drv_hash}-{drv_name}.drv")), aterm)
             .expect("write scratch .drv file");
         (dir, store_dir, drv_path)
     }
@@ -518,7 +520,7 @@ mod tests {
         )
         .replace("{store}", store_dir.to_str());
         let root_path: StorePath = format!("{root_hash}-root.drv").parse().unwrap();
-        std::fs::write(
+        fs_err::write(
             guard.path().join(format!("{root_hash}-root.drv")),
             &root_aterm,
         )
