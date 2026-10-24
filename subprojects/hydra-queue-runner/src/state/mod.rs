@@ -2833,17 +2833,14 @@ impl State {
                 .as_ref()
                 .map(|(step, relation)| (step, relation.clone())),
         );
-        let dispatch_claim = step.dispatch_lock.clone().try_lock_owned().ok();
         if !is_new {
             // Outputs may have appeared since this step was queued, for
             // example through a concurrent build or an external store import.
             // A dispatcher, assigned builder or result handler still owns its
             // outcome until its claim is released.
-            if dispatch_claim.is_none() {
-                return CreateStepResult::Valid(step);
-            }
             return self.recheck_existing_step(step, &drv_path, &ctx).await;
         }
+        let dispatch_claim = step.dispatch_lock.clone().try_lock_owned().ok();
         self.metrics.queue_steps_created.inc();
         tracing::debug!("considering derivation '{drv_path}'");
 
@@ -3002,6 +2999,14 @@ impl State {
         drv_path: &StorePath,
         ctx: &InjectCtx,
     ) -> CreateStepResult {
+        // Every caller, including the known-build fast path, must respect
+        // an assigned builder or an old Step's retained dispatch claim.
+        let Ok(_dispatch_claim) = step.dispatch_lock.clone().try_lock_owned() else {
+            return CreateStepResult::Valid(step);
+        };
+        if step.get_previous_failure() {
+            return CreateStepResult::PreviousFailure(step);
+        }
         if step.get_finished() {
             return CreateStepResult::None;
         }
@@ -3022,6 +3027,11 @@ impl State {
             }
         }
         drop(conn);
+        if self.check_cached_failure(step.clone()).await {
+            step.set_previous_failure(true);
+            step.set_finished(true);
+            return CreateStepResult::PreviousFailure(step);
+        }
         self.revalidate_locally_valid_step(step, drv_path, &ctx.finished_drvs)
             .await
     }
@@ -3045,11 +3055,23 @@ impl State {
                 MAX_CONCURRENT_BUILD_INJECTION,
                 move |step::ByPtr(step)| async move {
                     let drv_path = step.get_drv_path().clone();
-                    if let CreateStepResult::None = self
+                    match self
                         .recheck_existing_step(step.clone(), &drv_path, ctx)
                         .await
                     {
-                        self.finish_direct_builds(&step).await;
+                        CreateStepResult::None => self.finish_direct_builds(&step).await,
+                        CreateStepResult::PreviousFailure(step) => {
+                            for build in step.get_direct_builds() {
+                                let build_id = build.id;
+                                match self.handle_previous_failure(build, step.clone()).await {
+                                    Ok(()) => self.builds.remove_by_id(build_id),
+                                    Err(e) => tracing::error!(
+                                        "failed to handle previous failure for build {build_id}: {e}"
+                                    ),
+                                }
+                            }
+                        }
+                        CreateStepResult::Valid(_) => {}
                     }
                 },
             )

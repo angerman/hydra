@@ -145,6 +145,10 @@ let
         printf '%s\n' 'build-users-group =' 'substituters =' \
           'experimental-features = nix-command' > "$NIX_CONF_DIR/nix.conf"
 
+        # Finish the schema initialization before concurrent local clients
+        # and the private daemon open the same SQLite database.
+        nix-store --init
+
         # The queue runner talks to the store through the daemon, which
         # listens at $NIX_STATE_DIR/daemon-socket/socket by default.
         nix-daemon &
