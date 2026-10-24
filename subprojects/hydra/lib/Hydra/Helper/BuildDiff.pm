@@ -42,6 +42,9 @@ sub buildDiff {
 
     my $n = 0;
     foreach my $build (@{$builds}) {
+        # The statuses shown as aborted (the stop sign in common.tt); keep in
+        # step with restart_aborted in Controller/JobsetEval.pm, or the Actions
+        # menu offers a restart that matches none of the builds it counted.
         my $aborted = $build->finished != 0 && (
             # aborted
             $build->buildstatus == 3
@@ -49,6 +52,8 @@ sub buildDiff {
             || $build->buildstatus == 4
             # timeout
             || $build->buildstatus == 7
+            # unsupported (no builder for its system or features; shown as aborted)
+            || $build->buildstatus == 9
             # log limit exceeded
             || $build->buildstatus == 10
         );
