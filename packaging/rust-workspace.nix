@@ -127,7 +127,10 @@ let
         postgresql_17
         nixCli
       ];
-      cargoNextestExtraArgs = "--run-ignored ignored-only -p hydra-queue-runner --lib cached_output failedpaths_record missing_output_remains_pending_on_recheck";
+      # The binary also includes `state`, duplicating these library tests.
+      # Running both copies concurrently shares fixed-output paths in the
+      # private store, so one copy can import the other copy's missing output.
+      cargoNextestExtraArgs = "--workspace --lib --run-ignored ignored-only cached_output failedpaths_record missing_output_remains_pending_on_recheck";
       preCheck = ''
         export LOGNAME="$(id -un)"
         export HYDRA_QUEUE_TEST_STORE="$TMPDIR/queue-test-store"
@@ -141,6 +144,10 @@ let
         export NIX_REMOTE="local?store=$NIX_STORE_DIR&state=$NIX_STATE_DIR&log=$NIX_LOG_DIR"
         printf '%s\n' 'build-users-group =' 'substituters =' \
           'experimental-features = nix-command' > "$NIX_CONF_DIR/nix.conf"
+
+        # Finish the schema initialization before concurrent local clients
+        # and the private daemon open the same SQLite database.
+        nix-store --init
 
         # The queue runner talks to the store through the daemon, which
         # listens at $NIX_STATE_DIR/daemon-socket/socket by default.

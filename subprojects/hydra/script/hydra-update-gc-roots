@@ -87,7 +87,6 @@ sub keepBuild {
     } elsif (!$build->finished || ($keepFailedDrvs && $build->buildstatus != 0)) {
         print STDERR "    warning: derivation ", printStorePath($storeDir, $build->drvpath), " has disappeared\n";
     }
-    }
 }
 
 
